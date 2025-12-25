@@ -15,24 +15,29 @@ export class BackendStack extends cdk.Stack {
       isDefault: true, // デフォルトVPC自動取得
     });
 
-    const accountEnv = "sandbox"
+    const accountEnv = "sandbox";
 
-    const bucket = new s3.Bucket(this, "LoggingBucket",{
-        bucketName: `${accountEnv}-backend-logging-bucket`,
-        removalPolicy: cdk.RemovalPolicy.DESTROY,
+    const bucket = new s3.Bucket(this, "LoggingBucket", {
+      bucketName: `${accountEnv}-backend-logging-bucket`,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
     const firehoseStream = new firehose.DeliveryStream(
       this,
       "LoggingDeliveryStream",
       {
+        deliveryStreamName: `backend-logging-delivery-stream`,
         destination: new firehose.S3Bucket(bucket),
       }
     );
 
-    const fluentBitRole = new iam.Role(this, "FluentBitRole", {
+    const ec2Role = new iam.Role(this, "SsmInstanceRole", {
       assumedBy: new iam.ServicePrincipal("ec2.amazonaws.com"),
     });
-    fluentBitRole.addToPolicy(
+    ec2Role.addManagedPolicy(
+      iam.ManagedPolicy.fromAwsManagedPolicyName("AmazonSSMManagedInstanceCore")
+    );
+
+    ec2Role.addToPolicy(
       new iam.PolicyStatement({
         actions: ["firehose:PutRecord", "firehose:PutRecordBatch"],
         resources: [firehoseStream.deliveryStreamArn],
@@ -46,14 +51,22 @@ export class BackendStack extends cdk.Stack {
       vpcSubnets: {
         subnetType: ec2.SubnetType.PUBLIC,
       },
-      role: fluentBitRole,
+      role: ec2Role,
       userData: ec2.UserData.custom(`
-        yum install -y amazon-linux-extras
-        amazon-linux-extras install fluent-bit
-        systemctl enable fluent-bit
-        systemctl start fluent-bit
+#!/bin/bash
+set -e
+cat <<EOF > /etc/yum.repos.d/fluent-bit.repo
+[fluent-bit]
+name = Fluent Bit
+baseurl = https://packages.fluentbit.io/amazonlinux/2023/
+gpgcheck=1
+gpgkey=https://packages.fluentbit.io/fluentbit.key
+enabled=1
+EOF
 
-        cat > /etc/fluent-bit/fluent-bit.conf << 'EOF'
+yum update -y && yum install -y fluent-bit
+
+cat > /etc/fluent-bit/fluent-bit.conf << 'EOF'
 [SERVICE]
     Flush        5
     Log_Level    info
@@ -66,10 +79,12 @@ export class BackendStack extends cdk.Stack {
 [OUTPUT]
     Name kinesis_firehose
     Match *
-    region ${this.region}
-    delivery_stream ${firehoseStream.deliveryStreamName}
+    region ap-northeast-1
+    delivery_stream backend-logging-delivery-stream
 EOF
 
+yum update -y && yum install -y fluent-bit
+systemctl daemon-reload
 systemctl enable fluent-bit
 systemctl start fluent-bit
 
